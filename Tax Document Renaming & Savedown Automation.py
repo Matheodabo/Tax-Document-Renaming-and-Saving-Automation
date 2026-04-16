@@ -375,12 +375,60 @@ def _substring_name_match(text: str, lookup: dict, min_token_length: int = 5) ->
     best_score = 0
 
     for key in lookup:
-        # Split on spaces, commas — get all meaningful tokens
         tokens = [t for t in re.split(r"[\s,]+", key) if len(t) >= min_token_length]
         if not tokens:
             continue
-        # Score = total length of tokens found as substrings in filename
         score = sum(len(t) for t in tokens if t.upper() in text_upper)
+        if score > best_score:
+            best_score = score
+            best_key   = key
+
+    return lookup[best_key] if best_key else None
+
+
+def _get_ambiguous_fund_candidates(cleaned: str, lookup: dict,
+                                   min_token_length: int = 5,
+                                   ambiguity_ratio: float = 0.65) -> list:
+    """
+    Return all lookup keys that scored >= ambiguity_ratio * top_score.
+    Used to detect when multiple funds share a common prefix (e.g. multiple Blackstone funds)
+    so we know to open the PDF and verify.
+    """
+    if not cleaned or not lookup:
+        return []
+
+    text_upper = cleaned.upper().replace(" ", "")
+    scored = []
+
+    for key in lookup:
+        tokens = [t for t in re.split(r"[\s,]+", key) if len(t) >= min_token_length]
+        score  = sum(len(t) for t in tokens if t.upper() in text_upper)
+        if score > 0:
+            scored.append((score, key))
+
+    if not scored:
+        return []
+
+    max_score = max(s for s, _ in scored)
+    return [key for s, key in scored if s >= max_score * ambiguity_ratio]
+
+
+def _resolve_fund_from_pdf(pdf_text: str, candidate_keys: list, lookup: dict) -> dict | None:
+    """
+    Given ambiguous fund candidates and the full PDF text, score each candidate
+    by how many of its tokens appear in the PDF (with spaces — real document text).
+    The fund whose name actually appears in the document wins.
+    """
+    if not pdf_text or not candidate_keys:
+        return None
+
+    upper = pdf_text.upper()
+    best_key   = None
+    best_score = 0
+
+    for key in candidate_keys:
+        tokens = [t for t in re.split(r"[\s,]+", key) if len(t) >= 4]
+        score  = sum(len(t) for t in tokens if t.upper() in upper)
         if score > best_score:
             best_score = score
             best_key   = key
@@ -391,16 +439,21 @@ def _substring_name_match(text: str, lookup: dict, min_token_length: int = 5) ->
 def parse_filename(stem: str, clients: dict = None, funds: dict = None) -> dict:
     """
     Extract year, form type, and optionally match fund/client from the filename.
-    Returns dict with keys: year, form_type, fund_match, client_match
+    Returns dict with keys: year, form_type, fund_match, client_match, ambiguous_fund_keys
+    ambiguous_fund_keys is set when multiple funds scored similarly — signals PDF verification needed.
     """
-    result = {"year": None, "form_type": None, "fund_match": None, "client_match": None}
+    result = {
+        "year": None, "form_type": None,
+        "fund_match": None, "client_match": None,
+        "ambiguous_fund_keys": [],
+    }
 
     upper = stem.upper()
 
     # Year — handle both standalone YYYY and YYYYMMDD formats
-    m = re.search(r"(20\d{2})\d{4}", stem)   # YYYYMMDD (e.g. 20251231)
+    m = re.search(r"(20\d{2})\d{4}", stem)
     if not m:
-        m = re.search(r"\b(20\d{2})\b", stem) # standalone YYYY
+        m = re.search(r"\b(20\d{2})\b", stem)
     if m:
         result["year"] = m.group(1)
 
@@ -413,14 +466,22 @@ def parse_filename(stem: str, clients: dict = None, funds: dict = None) -> dict:
         if result["form_type"]:
             break
 
-    # Fund and client matching from cleaned filename text
     cleaned = _clean_filename_for_matching(stem)
     if cleaned:
         if funds:
-            result["fund_match"] = (
-                _sliding_window_match(cleaned, funds, FILENAME_FUZZY_THRESHOLD)
-                or _substring_name_match(cleaned, funds)
-            )
+            candidates = _get_ambiguous_fund_candidates(cleaned, funds)
+            if len(candidates) > 1:
+                # Multiple similar funds — flag for PDF verification
+                result["ambiguous_fund_keys"] = candidates
+                result["fund_match"] = funds.get(candidates[0])  # tentative
+            elif len(candidates) == 1:
+                result["fund_match"] = funds.get(candidates[0])
+            else:
+                result["fund_match"] = (
+                    _sliding_window_match(cleaned, funds, FILENAME_FUZZY_THRESHOLD)
+                    or _substring_name_match(cleaned, funds)
+                )
+
         if clients:
             result["client_match"] = (
                 _sliding_window_match(cleaned, clients, FILENAME_FUZZY_THRESHOLD)
@@ -504,19 +565,21 @@ def process_folder(drop_folder: Path, clients: dict, funds: dict,
         print(f"Processing: {pdf_path.name}")
 
         # ── Step 1: Try filename first ─────────────────────────────────
-        fn = parse_filename(pdf_path.stem, clients=clients, funds=funds)
-        year        = fn["year"]
-        form_type   = fn["form_type"]
-        fund_match  = fn["fund_match"]
-        client_match = fn["client_match"]
+        fn              = parse_filename(pdf_path.stem, clients=clients, funds=funds)
+        year            = fn["year"]
+        form_type       = fn["form_type"]
+        fund_match      = fn["fund_match"]
+        client_match    = fn["client_match"]
+        ambiguous_funds = fn["ambiguous_fund_keys"]
 
         if debug:
+            amb_note = f" (AMBIGUOUS x{len(ambiguous_funds)} -- will verify in PDF)" if ambiguous_funds else ""
             print(f"  [FILENAME] year={year} form={form_type} "
-                  f"fund={'YES: ' + fund_match['canonical'] if fund_match else 'no match'} "
+                  f"fund={'YES: ' + fund_match['canonical'] if fund_match else 'no match'}{amb_note} "
                   f"client={'YES: ' + client_match['canonical'] if client_match else 'no match'}")
 
-        # ── Step 2: Open PDF only for what filename didn't resolve ─────
-        need_pdf = not fund_match or not client_match
+        # ── Step 2: Open PDF when fund is ambiguous, missing, or client missing ──
+        need_pdf = bool(ambiguous_funds) or not fund_match or not client_match
         if need_pdf:
             fields = extract_pdf_fields(pdf_path, debug=debug)
 
@@ -525,7 +588,15 @@ def process_folder(drop_folder: Path, clients: dict, funds: dict,
             if not form_type:
                 form_type = fields["form_type"]
 
-            # Try config matching on PDF-extracted names if filename didn't match
+            # Resolve ambiguous fund using PDF text
+            if ambiguous_funds and fields.get("raw_text"):
+                resolved = _resolve_fund_from_pdf(fields["raw_text"], ambiguous_funds, funds)
+                if resolved:
+                    fund_match = resolved
+                    if debug:
+                        print(f"  [PDF VERIFY] Fund resolved to: {fund_match['canonical']}")
+
+            # Fall back to PDF text matching if still unresolved
             if not fund_match and fields.get("fund_name"):
                 fund_match = fuzzy_match(fields["fund_name"], funds)
             if not client_match and fields.get("client_raw"):
@@ -534,7 +605,7 @@ def process_folder(drop_folder: Path, clients: dict, funds: dict,
         else:
             fields = {"fund_name": None, "client_raw": None}
             if debug:
-                print(f"  [PDF SKIPPED — all info found in filename]")
+                print(f"  [PDF SKIPPED -- all info found in filename]")
 
         # ── Step 3: Validate ───────────────────────────────────────────
         if not year or not form_type:
