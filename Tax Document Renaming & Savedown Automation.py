@@ -235,8 +235,7 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
             if year_candidates:
                 result["year"] = year_candidates[0]
             else:
-                # Fallback: any 4-digit year anywhere
-                m = re.search(r"\b(20\d{2})\b", full_text)
+                m = re.search(r"(20\d{2})\d{4}", full_text) or re.search(r"\b(20\d{2})\b", full_text)
                 if m:
                     result["year"] = m.group(1)
 
@@ -361,33 +360,30 @@ def _sliding_window_match(text: str, lookup: dict, threshold: int) -> dict | Non
     return None
 
 
-def _substring_name_match(text: str, lookup: dict, min_length: int = 4) -> dict | None:
+def _substring_name_match(text: str, lookup: dict, min_token_length: int = 5) -> dict | None:
     """
-    Fallback for concatenated filenames (e.g. MATDWYER has no spaces).
-    Extracts the sort-key (last name) from each config entry and checks
-    if it appears as a substring inside the cleaned filename text.
-    Requires the matching segment to be at least min_length characters.
-    Returns the longest/best substring match, or None.
+    Fallback for concatenated filenames (e.g. MATHEOPDWYER, BlackstonePrivateCreditFundAdvisory).
+    Splits each config key into tokens, checks how many appear as substrings in the
+    cleaned filename text (spaces removed), and scores by total matched character length.
+    Returns the highest-scoring entry above zero, or None.
     """
     if not text or not lookup:
         return None
 
     text_upper = text.upper().replace(" ", "")
-    best_key    = None
-    best_length = 0
+    best_key   = None
+    best_score = 0
 
-    for key, entry in lookup.items():
-        # Extract last name: part before comma, or last word
-        if "," in key:
-            sort_key = key.split(",")[0].strip()
-        else:
-            sort_key = key.split()[-1].strip() if key.split() else key
-
-        sort_key = sort_key.upper()
-        if len(sort_key) >= min_length and sort_key in text_upper:
-            if len(sort_key) > best_length:
-                best_length = len(sort_key)
-                best_key    = key
+    for key in lookup:
+        # Split on spaces, commas — get all meaningful tokens
+        tokens = [t for t in re.split(r"[\s,]+", key) if len(t) >= min_token_length]
+        if not tokens:
+            continue
+        # Score = total length of tokens found as substrings in filename
+        score = sum(len(t) for t in tokens if t.upper() in text_upper)
+        if score > best_score:
+            best_score = score
+            best_key   = key
 
     return lookup[best_key] if best_key else None
 
@@ -401,8 +397,10 @@ def parse_filename(stem: str, clients: dict = None, funds: dict = None) -> dict:
 
     upper = stem.upper()
 
-    # Year
-    m = re.search(r"\b(20\d{2})\b", stem)
+    # Year — handle both standalone YYYY and YYYYMMDD formats
+    m = re.search(r"(20\d{2})\d{4}", stem)   # YYYYMMDD (e.g. 20251231)
+    if not m:
+        m = re.search(r"\b(20\d{2})\b", stem) # standalone YYYY
     if m:
         result["year"] = m.group(1)
 
