@@ -32,8 +32,10 @@ DROP_FOLDER   = Path(r"C:\path\to\drop folder")      # where you bulk-save downl
 
 # ══════════════════════════════════════════════════════════════════════
 
-CONFIG_FILE   = Path(__file__).parent / "config.xlsx"
-LOG_FILE      = Path(__file__).parent / "unmatched_log.csv"
+CONFIG_XLSX       = Path(__file__).parent / "config.xlsx"
+CONFIG_CSV_CLIENTS = Path(__file__).parent / "config_clients.csv"
+CONFIG_CSV_FUNDS   = Path(__file__).parent / "config_funds.csv"
+LOG_FILE           = Path(__file__).parent / "unmatched_log.csv"
 
 BY_CLIENT = SAVE_LOCATION / "Savedowns" / "By Client"
 BY_FUND   = SAVE_LOCATION / "Savedowns" / "By Fund"
@@ -73,46 +75,62 @@ NAME_NOISE_PATTERNS = [
 #  CONFIG LOADER
 # ══════════════════════════════════════════════════════════════════════
 
-def load_config(config_path: Path) -> tuple[dict, dict]:
-    """
-    Load config.xlsx and return two lookup dicts:
-      clients: {variant_string_upper -> {"canonical": str, "folder": Path}}
-      funds:   {variant_string_upper -> {"canonical": str, "folder": Path}}
+def _build_lookup(df: "pd.DataFrame", base_path: Path) -> dict:
+    """Turn a clients or funds DataFrame into a fuzzy-match lookup dict."""
+    lookup = {}
+    for _, row in df.iterrows():
+        canonical = row.get("canonical_name", "").strip()
+        folder    = row.get("folder_name", canonical).strip()
+        variants  = row.get("name_variants", "").strip()
+        if not canonical:
+            continue
+        all_names = [canonical] + [v.strip() for v in variants.split(";") if v.strip()]
+        for name in all_names:
+            lookup[name.upper()] = {
+                "canonical": canonical,
+                "folder":    base_path / folder,
+            }
+    return lookup
 
-    config.xlsx must have two sheets:
-      'clients' columns: canonical_name | folder_name | name_variants (semicolon-separated)
-      'funds'   columns: canonical_name | folder_name | name_variants (semicolon-separated)
-    """
-    if not config_path.exists():
-        print(f"[WARNING] config.xlsx not found at {config_path}. Fuzzy matching disabled.")
-        return {}, {}
 
+def load_config() -> tuple[dict, dict]:
+    """
+    Load client and fund config. Tries config.xlsx first (two sheets: 'clients', 'funds').
+    Falls back to config_clients.csv + config_funds.csv if xlsx is not present.
+
+    Columns for both sources: canonical_name | folder_name | name_variants (semicolon-separated)
+    """
     clients, funds = {}, {}
 
-    for sheet, target_dict, base_path in [
-        ("clients", clients, BY_CLIENT),
-        ("funds",   funds,   BY_FUND),
+    if CONFIG_XLSX.exists():
+        print(f"Loading config from {CONFIG_XLSX.name}")
+        for sheet, target, base in [("clients", clients, BY_CLIENT), ("funds", funds, BY_FUND)]:
+            try:
+                df = pd.read_excel(CONFIG_XLSX, sheet_name=sheet, dtype=str).fillna("")
+                target.update(_build_lookup(df, base))
+            except Exception as e:
+                print(f"[WARNING] Could not read '{sheet}' sheet from xlsx: {e}")
+        return clients, funds
+
+    # Fallback: CSV files
+    loaded_any = False
+    for csv_path, target, base, label in [
+        (CONFIG_CSV_CLIENTS, clients, BY_CLIENT, "clients"),
+        (CONFIG_CSV_FUNDS,   funds,   BY_FUND,   "funds"),
     ]:
-        try:
-            df = pd.read_excel(config_path, sheet_name=sheet, dtype=str).fillna("")
-        except Exception as e:
-            print(f"[WARNING] Could not read '{sheet}' sheet: {e}")
-            continue
+        if csv_path.exists():
+            print(f"Loading {label} config from {csv_path.name}")
+            try:
+                df = pd.read_csv(csv_path, dtype=str).fillna("")
+                target.update(_build_lookup(df, base))
+                loaded_any = True
+            except Exception as e:
+                print(f"[WARNING] Could not read {csv_path.name}: {e}")
+        else:
+            print(f"[WARNING] {csv_path.name} not found.")
 
-        for _, row in df.iterrows():
-            canonical = row.get("canonical_name", "").strip()
-            folder    = row.get("folder_name", canonical).strip()
-            variants  = row.get("name_variants", "").strip()
-
-            if not canonical:
-                continue
-
-            all_names = [canonical] + [v.strip() for v in variants.split(";") if v.strip()]
-            for name in all_names:
-                target_dict[name.upper()] = {
-                    "canonical": canonical,
-                    "folder":    base_path / folder,
-                }
+    if not loaded_any:
+        print("[WARNING] No config files found. Fuzzy matching disabled.")
 
     return clients, funds
 
@@ -480,7 +498,7 @@ if __name__ == "__main__":
     elif dry_run:
         print("=== DRY RUN — no files will be moved ===\n")
 
-    clients, funds = load_config(CONFIG_FILE)
+    clients, funds = load_config()
     print(f"Config loaded: {len(clients)} client entries, {len(funds)} fund entries.\n")
 
     process_folder(DROP_FOLDER, clients, funds, debug=debug, dry_run=dry_run)
