@@ -42,6 +42,8 @@ BY_FUND   = SAVE_LOCATION / "Savedowns" / "By Fund"
 
 FUZZY_THRESHOLD = 75   # minimum score (0–100) to accept a fuzzy match
 
+FILENAME_FUZZY_THRESHOLD = 70  # slightly looser for filename matching (no OCR noise)
+
 # ──────────────────────────────────────────────────────────────────────
 #  KNOWN FORM TYPES  (add variants as you encounter them)
 # ──────────────────────────────────────────────────────────────────────
@@ -306,20 +308,68 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  FILENAME PARSING (fallback)
+#  FILENAME PARSING — year, form type, and config matching
 # ══════════════════════════════════════════════════════════════════════
 
-def parse_filename(filename: str) -> dict:
+def _clean_filename_for_matching(stem: str) -> str:
     """
-    Try to extract year and form type from the raw filename as a fallback.
-    Pattern: NUMBERS bla FUND bla CLIENT bla DOCTYPE bla NUMBERS
+    Strip noise from a filename stem to expose meaningful name tokens.
+    Removes: pure number chunks, known form type strings, years.
     """
-    result = {"year": None, "form_type": None}
+    s = stem.upper()
+    # Remove form type keywords
+    for keywords in FORM_KEYWORDS.values():
+        for kw in keywords:
+            s = s.replace(kw.upper().replace("-", "").replace(" ", ""), " ")
+            s = s.replace(kw.upper(), " ")
+    # Remove years
+    s = re.sub(r"\b20\d{2}\b", " ", s)
+    # Remove pure number chunks (reference numbers)
+    s = re.sub(r"\b\d+\b", " ", s)
+    # Replace underscores, dashes, dots with spaces
+    s = re.sub(r"[_\-\.]+", " ", s)
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-    upper = filename.upper()
+
+def _sliding_window_match(text: str, lookup: dict, threshold: int) -> dict | None:
+    """
+    Try every 1-to-5 word window of text against lookup keys.
+    Returns the best match above threshold, or None.
+    """
+    if not text or not lookup:
+        return None
+
+    tokens = text.split()
+    keys   = list(lookup.keys())
+    best_score = 0
+    best_match = None
+
+    for size in range(min(5, len(tokens)), 0, -1):
+        for i in range(len(tokens) - size + 1):
+            window = " ".join(tokens[i:i + size])
+            match, score, _ = process.extractOne(window, keys, scorer=fuzz.token_sort_ratio)
+            if score > best_score:
+                best_score = score
+                best_match = match
+
+    if best_score >= threshold:
+        return lookup[best_match]
+    return None
+
+
+def parse_filename(stem: str, clients: dict = None, funds: dict = None) -> dict:
+    """
+    Extract year, form type, and optionally match fund/client from the filename.
+    Returns dict with keys: year, form_type, fund_match, client_match
+    """
+    result = {"year": None, "form_type": None, "fund_match": None, "client_match": None}
+
+    upper = stem.upper()
 
     # Year
-    m = re.search(r"\b(20\d{2})\b", filename)
+    m = re.search(r"\b(20\d{2})\b", stem)
     if m:
         result["year"] = m.group(1)
 
@@ -331,6 +381,16 @@ def parse_filename(filename: str) -> dict:
                 break
         if result["form_type"]:
             break
+
+    # Fund and client matching from cleaned filename text
+    cleaned = _clean_filename_for_matching(stem)
+    if debug_mode := False:  # set True temporarily to see cleaned filename
+        print(f"  CLEANED FILENAME: {cleaned}")
+    if cleaned:
+        if funds:
+            result["fund_match"] = _sliding_window_match(cleaned, funds, FILENAME_FUZZY_THRESHOLD)
+        if clients:
+            result["client_match"] = _sliding_window_match(cleaned, clients, FILENAME_FUZZY_THRESHOLD)
 
     return result
 
@@ -388,7 +448,13 @@ def write_log(log_path: Path, pdf_path: Path, reason: str, fields: dict):
 def process_folder(drop_folder: Path, clients: dict, funds: dict,
                    debug: bool = False, dry_run: bool = False):
 
-    pdfs = list(drop_folder.glob("*.pdf")) + list(drop_folder.glob("*.PDF"))
+    # Deduplicate by resolved lowercase path (fixes Windows *.pdf + *.PDF double-match)
+    seen = {}
+    for p in drop_folder.glob("*"):
+        if p.suffix.lower() == ".pdf" and p.is_file():
+            seen[str(p).lower()] = p
+    pdfs = sorted(seen.values())
+
     if not pdfs:
         print(f"No PDFs found in {drop_folder}")
         return
@@ -402,65 +468,87 @@ def process_folder(drop_folder: Path, clients: dict, funds: dict,
     for pdf_path in pdfs:
         print(f"Processing: {pdf_path.name}")
 
-        # 1. Extract from PDF
-        fields = extract_pdf_fields(pdf_path, debug=debug)
+        # ── Step 1: Try filename first ─────────────────────────────────
+        fn = parse_filename(pdf_path.stem, clients=clients, funds=funds)
+        year        = fn["year"]
+        form_type   = fn["form_type"]
+        fund_match  = fn["fund_match"]
+        client_match = fn["client_match"]
 
-        # 2. Fallback to filename if PDF extraction missed something
-        fn_fields = parse_filename(pdf_path.stem)
-        if not fields["year"]:
-            fields["year"] = fn_fields["year"]
-        if not fields["form_type"]:
-            fields["form_type"] = fn_fields["form_type"]
+        if debug:
+            print(f"  [FILENAME] year={year} form={form_type} "
+                  f"fund={'YES: ' + fund_match['canonical'] if fund_match else 'no match'} "
+                  f"client={'YES: ' + client_match['canonical'] if client_match else 'no match'}")
 
-        # 3. Validate we have the minimum required fields
-        missing = [k for k in ("year", "form_type", "fund_name", "client_raw") if not fields.get(k)]
-        if missing:
-            reason = f"Could not extract: {', '.join(missing)}"
+        # ── Step 2: Open PDF only for what filename didn't resolve ─────
+        need_pdf = not fund_match or not client_match
+        if need_pdf:
+            fields = extract_pdf_fields(pdf_path, debug=debug)
+
+            if not year:
+                year = fields["year"]
+            if not form_type:
+                form_type = fields["form_type"]
+
+            # Try config matching on PDF-extracted names if filename didn't match
+            if not fund_match and fields.get("fund_name"):
+                fund_match = fuzzy_match(fields["fund_name"], funds)
+            if not client_match and fields.get("client_raw"):
+                client_name_raw = clean_client_name(fields["client_raw"])
+                client_match = fuzzy_match(client_name_raw, clients)
+        else:
+            fields = {"fund_name": None, "client_raw": None}
+            if debug:
+                print(f"  [PDF SKIPPED — all info found in filename]")
+
+        # ── Step 3: Validate ───────────────────────────────────────────
+        if not year or not form_type:
+            reason = f"Could not extract: {', '.join(k for k, v in [('year', year), ('form_type', form_type)] if not v)}"
             print(f"  [SKIP] {reason}")
-            write_log(LOG_FILE, pdf_path, reason, fields)
+            write_log(LOG_FILE, pdf_path, reason, {"year": year, "form_type": form_type,
+                      "fund_name": fields.get("fund_name"), "client_raw": fields.get("client_raw")})
             skipped_count += 1
             continue
 
-        # 4. Clean client name
-        client_name = clean_client_name(fields["client_raw"])
+        if not fund_match or not client_match:
+            missing = []
+            if not fund_match:
+                missing.append(f"fund (saw: '{fields.get('fund_name', 'nothing')}')")
+            if not client_match:
+                missing.append(f"client (saw: '{fields.get('client_raw', 'nothing')}')")
+            reason = f"No config match for: {', '.join(missing)}"
+            print(f"  [SKIP] {reason}")
+            write_log(LOG_FILE, pdf_path, reason, {"year": year, "form_type": form_type,
+                      "fund_name": fields.get("fund_name"), "client_raw": fields.get("client_raw")})
+            skipped_count += 1
+            continue
 
-        # 5. Fuzzy match fund and client to config
-        fund_match   = fuzzy_match(fields["fund_name"], funds)
-        client_match = fuzzy_match(client_name, clients)
+        # ── Step 4: Build filenames ────────────────────────────────────
+        fund_canonical   = fund_match["canonical"]
+        client_canonical = client_match["canonical"]
+        fund_folder_path   = fund_match["folder"]
+        client_folder_path = client_match["folder"]
 
-        fund_canonical   = fund_match["canonical"]   if fund_match   else fields["fund_name"]
-        client_canonical = client_match["canonical"] if client_match else client_name
-        fund_folder_path   = fund_match["folder"]    if fund_match   else BY_FUND   / fund_canonical
-        client_folder_path = client_match["folder"]  if client_match else BY_CLIENT / client_canonical
-
-        year      = fields["year"]
-        form_type = fields["form_type"]
-
-        # 6. Build output filenames
         fund_filename   = fund_folder_filename(client_canonical, year, form_type, fund_canonical)
         client_filename = client_folder_filename(fund_canonical, client_canonical, year, form_type)
 
         fund_dest   = fund_folder_path   / fund_filename
         client_dest = client_folder_path / client_filename
 
-        # 7. Report
+        # ── Step 5: Report ─────────────────────────────────────────────
         print(f"  Client  : {client_canonical}")
         print(f"  Fund    : {fund_canonical}")
         print(f"  Year    : {year}  |  Form: {form_type}")
-        print(f"  → Fund folder  : {fund_dest}")
-        print(f"  → Client folder: {client_dest}")
-
-        if not fund_match:
-            print(f"  [WARN] Fund not in config — folder may not exist: {fund_folder_path}")
-        if not client_match:
-            print(f"  [WARN] Client not in config — folder may not exist: {client_folder_path}")
+        print(f"  -> Fund folder  : {fund_dest}")
+        print(f"  -> Client folder: {client_dest}")
 
         if dry_run or debug:
-            print(f"  [DRY RUN — no files moved]")
+            print(f"  [DRY RUN -- no files moved]")
             ok_count += 1
+            print()
             continue
 
-        # 8. Copy files
+        # ── Step 6: Copy ───────────────────────────────────────────────
         errors = []
         for dest in (fund_dest, client_dest):
             try:
@@ -472,7 +560,8 @@ def process_folder(drop_folder: Path, clients: dict, funds: dict,
         if errors:
             reason = "; ".join(errors)
             print(f"  [ERROR] {reason}")
-            write_log(LOG_FILE, pdf_path, reason, fields)
+            write_log(LOG_FILE, pdf_path, reason, {"year": year, "form_type": form_type,
+                      "fund_name": fund_canonical, "client_raw": client_canonical})
             skipped_count += 1
         else:
             print(f"  [OK]")
