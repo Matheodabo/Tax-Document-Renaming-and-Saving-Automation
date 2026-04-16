@@ -171,15 +171,17 @@ def extract_last_name(name: str) -> str:
     return parts[-1] if parts else name
 
 
-def fund_folder_filename(client_name: str, year: str, form_type: str, fund_name: str) -> str:
-    """LastName, FullName - Year - FormType - FundName.pdf"""
-    last = extract_last_name(client_name)
-    return f"{last}, {client_name} - {year} - {form_type} - {fund_name}.pdf"
+def fund_folder_dest(base: Path, client_name: str, year: str, form_type: str, fund_name: str) -> Path:
+    """base / Year / FormType / LastName, FullName - Year - FormType - FundName.pdf"""
+    last     = extract_last_name(client_name)
+    filename = f"{last}, {client_name} - {year} - {form_type} - {fund_name}.pdf"
+    return base / year / form_type / filename
 
 
-def client_folder_filename(fund_name: str, client_name: str, year: str, form_type: str) -> str:
-    """FundName - ClientName - Year - FormType.pdf"""
-    return f"{fund_name} - {client_name} - {year} - {form_type}.pdf"
+def client_folder_dest(base: Path, fund_name: str, client_name: str, year: str, form_type: str) -> Path:
+    """base / Year / FormType / FundName - ClientName - Year - FormType.pdf"""
+    filename = f"{fund_name} - {client_name} - {year} - {form_type}.pdf"
+    return base / year / form_type / filename
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -359,6 +361,37 @@ def _sliding_window_match(text: str, lookup: dict, threshold: int) -> dict | Non
     return None
 
 
+def _substring_name_match(text: str, lookup: dict, min_length: int = 4) -> dict | None:
+    """
+    Fallback for concatenated filenames (e.g. MATDWYER has no spaces).
+    Extracts the sort-key (last name) from each config entry and checks
+    if it appears as a substring inside the cleaned filename text.
+    Requires the matching segment to be at least min_length characters.
+    Returns the longest/best substring match, or None.
+    """
+    if not text or not lookup:
+        return None
+
+    text_upper = text.upper().replace(" ", "")
+    best_key    = None
+    best_length = 0
+
+    for key, entry in lookup.items():
+        # Extract last name: part before comma, or last word
+        if "," in key:
+            sort_key = key.split(",")[0].strip()
+        else:
+            sort_key = key.split()[-1].strip() if key.split() else key
+
+        sort_key = sort_key.upper()
+        if len(sort_key) >= min_length and sort_key in text_upper:
+            if len(sort_key) > best_length:
+                best_length = len(sort_key)
+                best_key    = key
+
+    return lookup[best_key] if best_key else None
+
+
 def parse_filename(stem: str, clients: dict = None, funds: dict = None) -> dict:
     """
     Extract year, form type, and optionally match fund/client from the filename.
@@ -384,13 +417,17 @@ def parse_filename(stem: str, clients: dict = None, funds: dict = None) -> dict:
 
     # Fund and client matching from cleaned filename text
     cleaned = _clean_filename_for_matching(stem)
-    if debug_mode := False:  # set True temporarily to see cleaned filename
-        print(f"  CLEANED FILENAME: {cleaned}")
     if cleaned:
         if funds:
-            result["fund_match"] = _sliding_window_match(cleaned, funds, FILENAME_FUZZY_THRESHOLD)
+            result["fund_match"] = (
+                _sliding_window_match(cleaned, funds, FILENAME_FUZZY_THRESHOLD)
+                or _substring_name_match(cleaned, funds)
+            )
         if clients:
-            result["client_match"] = _sliding_window_match(cleaned, clients, FILENAME_FUZZY_THRESHOLD)
+            result["client_match"] = (
+                _sliding_window_match(cleaned, clients, FILENAME_FUZZY_THRESHOLD)
+                or _substring_name_match(cleaned, clients)
+            )
 
     return result
 
@@ -523,17 +560,12 @@ def process_folder(drop_folder: Path, clients: dict, funds: dict,
             skipped_count += 1
             continue
 
-        # ── Step 4: Build filenames ────────────────────────────────────
+        # ── Step 4: Build destinations ─────────────────────────────────
         fund_canonical   = fund_match["canonical"]
         client_canonical = client_match["canonical"]
-        fund_folder_path   = fund_match["folder"]
-        client_folder_path = client_match["folder"]
 
-        fund_filename   = fund_folder_filename(client_canonical, year, form_type, fund_canonical)
-        client_filename = client_folder_filename(fund_canonical, client_canonical, year, form_type)
-
-        fund_dest   = fund_folder_path   / fund_filename
-        client_dest = client_folder_path / client_filename
+        fund_dest   = fund_folder_dest(fund_match["folder"],   client_canonical, year, form_type, fund_canonical)
+        client_dest = client_folder_dest(client_match["folder"], fund_canonical, client_canonical, year, form_type)
 
         # ── Step 5: Report ─────────────────────────────────────────────
         print(f"  Client  : {client_canonical}")
