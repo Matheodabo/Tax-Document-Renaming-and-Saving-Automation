@@ -70,6 +70,10 @@ NAME_NOISE_PATTERNS = [
     r"\s*\bIRREVOCABLE\b.*",
     r"\s*\bLIVING\s+TRUST\b.*",
     r"\s*\bFAMILY\s+TRUST\b.*",
+    r"\s*\bJT\.?\s+TEN\b.*",           # JT TEN (Joint Tenants)
+    r"\s*\bJT\.?\s+WROS\b.*",          # JT WROS (Joint with Right of Survivorship)
+    r"\s*\bTEN\.?\s+IN\s+COM\b.*",     # TEN IN COM (Tenants in Common)
+    r"\s*\bTOD\b.*",                   # TOD (Transfer on Death)
 ]
 
 
@@ -173,12 +177,37 @@ def clean_client_name(raw: str) -> str:
     else:
         combined = name_parts[0]
 
-    return combined.title().strip()
+    result = combined.title().strip()
+    return normalize_joint_name(result)
+
+
+def normalize_joint_name(name: str) -> str:
+    """
+    Compress joint names that share a last name.
+    "Amy Saperstein & Ron Saperstein" → "Amy & Ron Saperstein"
+    Returns the original if no simplification is possible.
+    """
+    if "&" not in name:
+        return name
+    parts = [p.strip() for p in name.split("&")]
+    if len(parts) != 2:
+        return name
+    tokens1 = parts[0].split()
+    tokens2 = parts[1].split()
+    if not tokens1 or not tokens2:
+        return name
+    if tokens1[-1].lower() == tokens2[-1].lower():
+        last   = tokens1[-1]
+        first1 = " ".join(tokens1[:-1])
+        first2 = " ".join(tokens2[:-1])
+        if first1 and first2:
+            return f"{first1} & {first2} {last}"
+    return name
 
 
 def extract_last_name(name: str) -> str:
     """Return the last name for alphabetical sorting.
-    Handles both 'First Last' and 'Last, First' config formats."""
+    Handles 'First Last', 'Last, First', and 'First1 & First2 Last' formats."""
     if "," in name:
         return name.split(",")[0].strip()
     parts = name.strip().split()
@@ -187,8 +216,15 @@ def extract_last_name(name: str) -> str:
 
 def fund_folder_dest(base: Path, client_name: str, year: str, form_type: str, fund_name: str) -> Path:
     """base / Year / FormType / LastName, FullName - Year - FormType - FundName.pdf"""
-    last     = extract_last_name(client_name)
-    filename = f"{last}, {client_name} - {year} - {form_type} - {fund_name}.pdf"
+    if "," in client_name:
+        # Config stores "Last, First" — convert to "First Last" for the full-name slot
+        last_part, first_part = client_name.split(",", 1)
+        last      = last_part.strip()
+        full_name = f"{first_part.strip()} {last}"
+    else:
+        last      = extract_last_name(client_name)
+        full_name = client_name
+    filename = f"{last}, {full_name} - {year} - {form_type} - {fund_name}.pdf"
     return base / year / form_type / filename
 
 
