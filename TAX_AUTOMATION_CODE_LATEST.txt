@@ -27,8 +27,8 @@ from rapidfuzz import process, fuzz
 #  CONFIGURATION  — edit these paths before running
 # ══════════════════════════════════════════════════════════════════════
 
-SAVE_LOCATION = Path(r"C:\path\to\Save Location")   # root folder containing Savedowns/
-DROP_FOLDER   = Path(r"C:\path\to\drop folder")      # where you bulk-save downloads
+SAVE_LOCATION = Path(r"C:\Users\matheo\pyvenv\myvenv\TaxAutomation\Save Location")
+DROP_FOLDER   = Path(r"C:\Users\matheo\pyvenv\myvenv\TaxAutomation\TaxDrop")
 
 # ══════════════════════════════════════════════════════════════════════
 
