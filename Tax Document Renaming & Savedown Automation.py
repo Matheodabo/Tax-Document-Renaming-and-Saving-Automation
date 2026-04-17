@@ -395,10 +395,18 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
                 r"DEPARTMENT\s+OF\s+THE|INTERNAL\s+REVENUE|COPY\s+[A-Z]\s+FOR",
                 re.IGNORECASE
             )
+            # Short standalone form labels that appear on their own line and
+            # must never be mistaken for a client name
+            _SHORT_LABEL_RE = re.compile(
+                r"^(TIN|FEIN|EIN|SSN|PAYER.S|RECIPIENT.S|CORRECTED|N/A)$",
+                re.IGNORECASE
+            )
             tl_crop_text = page.crop((0, 0, w * 0.55, h * 0.60)).extract_text() or ""
             tl_crop_lines = [
                 l.strip() for l in tl_crop_text.splitlines()
-                if l.strip() and not _LABEL_RE.search(l)
+                if l.strip()
+                and not _LABEL_RE.search(l)
+                and not _SHORT_LABEL_RE.match(l.strip())
             ]
 
             if debug:
@@ -708,7 +716,7 @@ def fuzzy_match(query: str, lookup: dict, threshold: int = FUZZY_THRESHOLD,
         print(f"    fuzzy_match query : '{norm_query}'  (threshold={threshold})")
         for match_key, score, _ in all_hits:
             marker = "MATCH >" if score >= threshold else "      "
-            print(f"    {marker}  {score:3d}  '{match_key}'")
+            print(f"    {marker}  {int(score):3d}  '{match_key}'")
 
     if all_hits and all_hits[0][1] >= threshold:
         return lookup[all_hits[0][0]]
@@ -846,6 +854,17 @@ def process_folder(drop_folder: Path, clients: dict, funds: dict,
                 print(f"  after cleaning : {repr(client_name_raw)}")
                 print(f"  normalized     : {repr(_normalize_name(client_name_raw))}")
             client_match = fuzzy_match(client_name_raw, clients, debug=debug)
+
+            # Substring fallback: handles concatenated PDF text where extract_text()
+            # drops spaces (e.g. "ANDREWSAPERSTEIN" instead of "ANDREW SAPERSTEIN").
+            # Searches for config key tokens directly inside the space-stripped raw text.
+            if not client_match:
+                if debug:
+                    print(f"  Fuzzy failed — trying substring match on raw client text")
+                client_match = _substring_name_match(fields["client_raw"], clients)
+                if client_match and debug:
+                    print(f"  [CLIENT via substring] --> {client_match['canonical']}")
+
             if client_match and debug:
                 print(f"  [CLIENT via PDF] --> {client_match['canonical']}")
         elif debug:
