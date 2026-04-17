@@ -402,7 +402,9 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
             ]
 
             if debug:
-                print(f"CROP LINES: {tl_crop_lines}")
+                print(f"  [CROP] all top-left lines ({len(tl_crop_lines)}):")
+                for i, l in enumerate(tl_crop_lines):
+                    print(f"    [{i}] {repr(l)}")
 
             had_payer_digits = False
             payer_block_done = False
@@ -421,9 +423,13 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
 
             if crop_client_lines:
                 result["client_raw"] = "\n".join(crop_client_lines)
+                if debug:
+                    print(f"  [CLIENT METHOD 1 - crop] captured: {crop_client_lines}")
 
             # Method 2 (fallback): RECIPIENT label anchor using word coordinates
             if not result["client_raw"]:
+                if debug:
+                    print(f"  [CLIENT METHOD 1 failed — trying Method 2: RECIPIENT anchor]")
                 recipient_y = None
                 for ww in words:
                     if "RECIPIENT" in ww["text"].upper() and ww["x0"] < w * 0.55:
@@ -441,7 +447,7 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
                     below_lines = _group_words_into_lines(below_words)
 
                     if debug:
-                        print(f"RECIPIENT LINES (fallback): {below_lines}")
+                        print(f"  [RECIPIENT anchor lines]: {below_lines}")
 
                     client_lines = []
                     for line in below_lines:
@@ -454,9 +460,15 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
                             break
                     if client_lines:
                         result["client_raw"] = "\n".join(client_lines)
+                        if debug:
+                            print(f"  [CLIENT METHOD 2 - RECIPIENT] captured: {client_lines}")
+                elif debug:
+                    print(f"  [CLIENT METHOD 2 failed — RECIPIENT word not found in word list]")
 
             # Method 3 (last resort): heuristic address-skipping on top-left word lines
             if not result["client_raw"] and tl_lines:
+                if debug:
+                    print(f"  [CLIENT METHOD 3 - heuristic fallback]")
                 address_done = False
                 client_lines = []
                 for line in tl_lines[1:]:
@@ -471,6 +483,11 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
                         client_lines.append(line)
                 if client_lines:
                     result["client_raw"] = "\n".join(client_lines)
+                    if debug:
+                        print(f"  [CLIENT METHOD 3] captured: {client_lines}")
+
+            if debug:
+                print(f"  [CLIENT RAW FINAL]: {repr(result['client_raw'])}")
 
     except Exception as e:
         print(f"[ERROR] Could not read {pdf_path.name}: {e}")
@@ -684,14 +701,17 @@ def fuzzy_match(query: str, lookup: dict, threshold: int = FUZZY_THRESHOLD,
 
     keys       = list(lookup.keys())
     norm_query = _normalize_name(query)
-    top3       = process.extract(norm_query, keys, scorer=fuzz.token_sort_ratio, limit=3)
+    all_hits   = process.extract(norm_query, keys, scorer=fuzz.token_sort_ratio, limit=None)
+    all_hits.sort(key=lambda x: -x[1])
 
-    if debug and top3:
-        hits = ", ".join(f"'{m}' ({s})" for m, s, _ in top3)
-        print(f"    fuzzy_match('{norm_query}') → {hits} [threshold={threshold}]")
+    if debug:
+        print(f"    fuzzy_match query : '{norm_query}'  (threshold={threshold})")
+        for match_key, score, _ in all_hits:
+            marker = "MATCH >" if score >= threshold else "      "
+            print(f"    {marker}  {score:3d}  '{match_key}'")
 
-    if top3 and top3[0][1] >= threshold:
-        return lookup[top3[0][0]]
+    if all_hits and all_hits[0][1] >= threshold:
+        return lookup[all_hits[0][0]]
     return None
 
 
@@ -820,14 +840,26 @@ def process_folder(drop_folder: Path, clients: dict, funds: dict,
 
         if fields.get("client_raw"):
             client_name_raw = clean_client_name(fields["client_raw"])
+            if debug:
+                print(f"  ── CLIENT MATCHING ──────────────────────────────────")
+                print(f"  client_raw     : {repr(fields['client_raw'])}")
+                print(f"  after cleaning : {repr(client_name_raw)}")
+                print(f"  normalized     : {repr(_normalize_name(client_name_raw))}")
             client_match = fuzzy_match(client_name_raw, clients, debug=debug)
             if client_match and debug:
-                print(f"  [CLIENT via PDF] {client_match['canonical']}")
+                print(f"  [CLIENT via PDF] --> {client_match['canonical']}")
+        elif debug:
+            print(f"  ── CLIENT MATCHING ──────────────────────────────────")
+            print(f"  client_raw: None — PDF extraction returned nothing")
 
         if not client_match:
+            if debug:
+                print(f"  PDF client match failed — trying filename fallback")
             client_match = fn_client_match
             if client_match and debug:
-                print(f"  [CLIENT via filename] {client_match['canonical']}")
+                print(f"  [CLIENT via filename] --> {client_match['canonical']}")
+            elif debug:
+                print(f"  [CLIENT] no match found from any source")
 
         # ── Step 4: Validate ───────────────────────────────────────────
         if not year or not form_type:
