@@ -177,7 +177,10 @@ def clean_client_name(raw: str) -> str:
 
 
 def extract_last_name(name: str) -> str:
-    """Return the last word of the name for alphabetical sorting."""
+    """Return the last name for alphabetical sorting.
+    Handles both 'First Last' and 'Last, First' config formats."""
+    if "," in name:
+        return name.split(",")[0].strip()
     parts = name.strip().split()
     return parts[-1] if parts else name
 
