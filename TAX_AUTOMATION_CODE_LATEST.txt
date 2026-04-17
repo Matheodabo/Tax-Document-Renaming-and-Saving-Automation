@@ -73,6 +73,7 @@ NAME_NOISE_PATTERNS = [
     r"\s*\bJT\.?\s+TEN\b.*",           # JT TEN (Joint Tenants)
     r"\s*\bJT\.?\s+WROS\b.*",          # JT WROS (Joint with Right of Survivorship)
     r"\s*\bTEN\.?\s+IN\s+COM\b.*",     # TEN IN COM (Tenants in Common)
+    r"\s*\bTEN\s+COM\b.*",             # TEN COM (short form)
     r"\s*\bTOD\b.*",                   # TOD (Transfer on Death)
 ]
 
@@ -187,12 +188,18 @@ def clean_client_name(raw: str) -> str:
     if not name_parts:
         return raw.strip()
 
-    # If the first part is a single token (first name only), join with the next
-    # part to reconstruct names split across two PDF lines (e.g. "JOHN"/"MEYERSTEIN")
-    if len(name_parts) > 1 and len(name_parts[0].split()) == 1:
+    # Join across lines when:
+    #   - first part ends with & (joint name split mid-line, e.g. "RON SAPERSTEIN &" / "AMY R SAPERSTEIN")
+    #   - first part is a single token (first name only, e.g. "JOHN" / "MEYERSTEIN")
+    if len(name_parts) > 1 and name_parts[0].rstrip().endswith("&"):
+        combined = " ".join(name_parts[:2])
+    elif len(name_parts) > 1 and len(name_parts[0].split()) == 1:
         combined = " ".join(name_parts[:2])
     else:
         combined = name_parts[0]
+
+    # Strip any orphaned trailing & (e.g. if second person line was empty after noise stripping)
+    combined = combined.strip().rstrip("&").strip()
 
     result = combined.title().strip()
     return normalize_joint_name(result)
