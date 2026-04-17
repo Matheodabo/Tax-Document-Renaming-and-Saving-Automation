@@ -145,24 +145,35 @@ def clean_client_name(raw: str) -> str:
     """
     Given a raw multi-line client name block, return the cleaned primary name.
     e.g. "JOHN SMITH CO TTEE\n1998 THEO TRUST\nC/O BLABLA" → "John Smith"
+
+    Handles names split across two lines in the PDF (e.g. "JOHN" / "MEYERSTEIN")
+    by joining lines when the first cleaned line is a single token (first name only).
     """
-    # Take only the first non-empty line
-    first_line = ""
+    name_parts = []
     for line in raw.strip().splitlines():
         line = line.strip()
-        if line:
-            first_line = line
+        if not line:
+            continue
+        # Stop at address or C/O lines
+        if re.search(r"\d", line) or re.match(r"C\s*/?\s*O\b", line, re.IGNORECASE):
             break
+        cleaned = line.upper()
+        for pattern in NAME_NOISE_PATTERNS:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+        if cleaned:
+            name_parts.append(cleaned)
 
-    if not first_line:
+    if not name_parts:
         return raw.strip()
 
-    cleaned = first_line.upper()
-    for pattern in NAME_NOISE_PATTERNS:
-        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+    # If the first part is a single token (first name only), join with the next
+    # part to reconstruct names split across two PDF lines (e.g. "JOHN"/"MEYERSTEIN")
+    if len(name_parts) > 1 and len(name_parts[0].split()) == 1:
+        combined = " ".join(name_parts[:2])
+    else:
+        combined = name_parts[0]
 
-    # Title-case the result
-    return cleaned.title().strip()
+    return combined.title().strip()
 
 
 def extract_last_name(name: str) -> str:
@@ -278,13 +289,18 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
             if m:
                 result["fund_row_name"] = m.group(1).strip()
 
-            # ── Share class (CL I/S, CLASS I/S, SERIES I/S) ──────────────
+            # ── Share class (CL I/S, CLASS I/S, SERIES I/S, or trailing token in Fund: row) ──
             m = re.search(
                 r"\bCLASS\s+([A-Z])\b|\bCL\.?\s+([A-Z])\b|\bSERIES\s+([A-Z])\b",
                 full_text, re.IGNORECASE
             )
             if m:
                 result["share_class"] = next(g for g in m.groups() if g).upper()
+            elif result.get("fund_row_name"):
+                # Fallback: last token of Fund: row is often the class letter (e.g. "… Q S" → "S")
+                last_tok = result["fund_row_name"].split()[-1]
+                if re.fullmatch(r"[A-Z]", last_tok, re.IGNORECASE):
+                    result["share_class"] = last_tok.upper()
 
             # ── Top-left region: payer block → fund name ─────────────────
             top_left_words = [
@@ -304,9 +320,10 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
                     break
 
             # ── Client name: anchor on RECIPIENT label ───────────────────
+            # Search full page height (label can sit past the 50% mark on some docs)
             recipient_y = None
             for ww in words:
-                if "RECIPIENT" in ww["text"].upper() and ww["x0"] < w * 0.55 and ww["top"] < h * 0.5:
+                if "RECIPIENT" in ww["text"].upper() and ww["x0"] < w * 0.55:
                     recipient_y = ww["top"]
                     break
 
@@ -314,7 +331,7 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
                 below_words = [
                     ww for ww in words
                     if ww["top"] > recipient_y + 2
-                    and ww["top"] < recipient_y + 120
+                    and ww["top"] < recipient_y + 150
                     and ww["x0"] < w * 0.55
                 ]
                 below_words.sort(key=lambda ww: (ww["top"], ww["x0"]))
@@ -663,7 +680,12 @@ def process_folder(drop_folder: Path, clients: dict, funds: dict,
         fund_match = None
 
         if fields.get("fund_row_name"):
-            fund_match = fuzzy_match(fields["fund_row_name"], funds)
+            # Lower threshold (60) — this field is explicitly labelled in the document.
+            # Also try sliding window since trailing noise (e.g. "Q S") can depress scores.
+            fund_match = (
+                fuzzy_match(fields["fund_row_name"], funds, threshold=60)
+                or _sliding_window_match(fields["fund_row_name"], funds, threshold=60)
+            )
             if fund_match and debug:
                 print(f"  [FUND via Fund: row] {fund_match['canonical']}")
 
