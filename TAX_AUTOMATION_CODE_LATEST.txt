@@ -170,21 +170,51 @@ def load_config() -> tuple[dict, dict]:
 #  NAME CLEANING
 # ══════════════════════════════════════════════════════════════════════
 
+_ENTITY_RE = re.compile(
+    r"\bTRUST\b|\bLLC\b|\bINC\.?\b|\bCORP\.?\b|\bFUND\b|\bFDN\b|\bFOUNDATION\b|\bL\.P\.?\b|\bLTD\.?\b",
+    re.IGNORECASE
+)
+
+
 def clean_client_name(raw: str) -> str:
     """
     Given a raw multi-line client name block, return the cleaned primary name.
-    e.g. "JOHN SMITH CO TTEE\n1998 THEO TRUST\nC/O BLABLA" → "John Smith"
 
-    Handles names split across two lines in the PDF (e.g. "JOHN" / "MEYERSTEIN")
-    by joining lines when the first cleaned line is a single token (first name only).
+    Trust/entity structure: if any line contains TTEE or TRUSTEE, the entity
+    name lives on the line(s) AFTER the last trustee line.
+      e.g. "MICHAEL B BIDWELL TTEE\\nJANE BIDWELL TTEE\\nBIDKID 2018 TRUST"
+           → "Bidkid 2018 Trust"
+
+    Regular names: strips TTEE/noise suffixes, joins split first-name lines,
+    compresses joint last names.
     """
+    lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
+
+    # ── Trust/entity path ─────────────────────────────────────────────
+    # Find lines that are trustee lines (contain TTEE or TRUSTEE anywhere,
+    # including concatenated forms like "MICHAELBBIDWELLTTEE")
+    ttee_indices = [
+        i for i, l in enumerate(lines)
+        if re.search(r"TTEE|TRUSTEE", l, re.IGNORECASE)
+    ]
+    if ttee_indices:
+        last_ttee = max(ttee_indices)
+        for line in lines[last_ttee + 1:]:
+            if re.match(r"C\s*/?\s*O\b", line, re.IGNORECASE):
+                break
+            if re.match(r"^\d{5}", line):   # ZIP code — stop
+                break
+            if line:
+                return line.strip().title()
+        # No entity line found after TTEE — fall through to default
+
+    # ── Regular name path ─────────────────────────────────────────────
     name_parts = []
-    for line in raw.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # Stop at address or C/O lines
-        if re.search(r"\d", line) or re.match(r"C\s*/?\s*O\b", line, re.IGNORECASE):
+    for line in lines:
+        # Stop at address or C/O lines (but allow entity names with years)
+        if re.match(r"C\s*/?\s*O\b", line, re.IGNORECASE):
+            break
+        if re.search(r"\d", line) and not _ENTITY_RE.search(line):
             break
         cleaned = line.upper()
         for pattern in NAME_NOISE_PATTERNS:
@@ -431,13 +461,16 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
             crop_client_lines = []
             for line in tl_crop_lines:
                 has_digit = bool(re.search(r"\d", line))
+                # Entity/trust names (e.g. "BIDKID 2018 TRUST") contain digits but
+                # are not address lines — allow them through in the client block
+                is_entity = has_digit and bool(_ENTITY_RE.search(line))
                 if not payer_block_done:
-                    if has_digit:
+                    if has_digit and not is_entity:
                         had_payer_digits = True
                     elif had_payer_digits:
                         payer_block_done = True
                 if payer_block_done:
-                    if has_digit:
+                    if has_digit and not is_entity:
                         break
                     crop_client_lines.append(line)
 
