@@ -391,8 +391,13 @@ def extract_pdf_fields(pdf_path: Path, debug: bool = False) -> dict:
             #   lines are the recipient name.
             #
             _LABEL_RE = re.compile(
+                # Spaced versions
                 r"PAYER.S\s+NAME|RECIPIENT.S\s+NAME|STREET\s+ADDR|KEEP\s+FOR|"
-                r"DEPARTMENT\s+OF\s+THE|INTERNAL\s+REVENUE|COPY\s+[A-Z]\s+FOR",
+                r"DEPARTMENT\s+OF\s+THE|INTERNAL\s+REVENUE|COPY\s+[A-Z]\s+FOR|"
+                # Concatenated versions (pdfplumber drops spaces on some PDFs)
+                r"streetaddress|cityortown|stateorprovince|ZIPorforeignpostal|"
+                r"keepforyourrecor|includingapt|andtelephonenumber|"
+                r"RECIPIENT.Sname|PAYER.Sname",
                 re.IGNORECASE
             )
             # Short standalone form labels that appear on their own line and
