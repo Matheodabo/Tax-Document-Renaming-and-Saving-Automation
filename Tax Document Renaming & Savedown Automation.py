@@ -7,9 +7,16 @@ Renames and copies tax documents (1099-DIVs, K-1s, etc.) into:
   Savedowns/By Client/  <ClientFolder>/ FundName - ClientName - Year - FormType.pdf
 
 Usage:
-  python "Tax Document Renaming & Savedown Automation.py"            # normal run
-  python "Tax Document Renaming & Savedown Automation.py" --debug    # print extractions, no file moves
-  python "Tax Document Renaming & Savedown Automation.py" --dry-run  # show what would happen, no file moves
+  python "Tax Document Renaming & Savedown Automation.py"             # normal run
+  python "Tax Document Renaming & Savedown Automation.py" --debug     # verbose extractions, no file moves
+  python "Tax Document Renaming & Savedown Automation.py" --debug2    # clean per-file extraction summary, no file moves
+  python "Tax Document Renaming & Savedown Automation.py" --dry-run   # show what would happen, no file moves
+
+Shortcut batch files (Windows):
+  debug.bat    → --debug
+  debug2.bat   → --debug2
+  dryrun.bat   → --dry-run
+  run.bat      → normal run
 """
 
 import re
@@ -963,12 +970,62 @@ def process_folder(drop_folder: Path, clients: dict, funds: dict,
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  DEBUG2 — clean per-file extraction preview (no matching, no moves)
+# ══════════════════════════════════════════════════════════════════════
+
+def debug2_folder(drop_folder: Path):
+    """
+    Pure extraction preview: opens every PDF, prints what the script
+    reads for client, fund, form type, year, and share class.
+    No fuzzy matching. No file moves. No config needed.
+    """
+    seen = {}
+    for p in drop_folder.glob("*"):
+        if p.suffix.lower() == ".pdf" and p.is_file():
+            seen[str(p).lower()] = p
+    pdfs = sorted(seen.values())
+
+    if not pdfs:
+        print(f"No PDFs found in {drop_folder}")
+        return
+
+    print(f"=== DEBUG2 — pure extraction preview ({len(pdfs)} PDF(s)) ===\n")
+
+    for i, pdf_path in enumerate(pdfs, 1):
+        fields = extract_pdf_fields(pdf_path, debug=False)
+        cleaned = clean_client_name(fields["client_raw"]) if fields.get("client_raw") else None
+
+        # Year from filename if PDF didn't yield one
+        fn = parse_filename(pdf_path.stem)
+        year      = fields["year"]      or fn["year"]      or "?"
+        form_type = fields["form_type"] or fn["form_type"] or "?"
+
+        fund_raw  = fields.get("fund_row_name") or fields.get("fund_name") or "?"
+        client_raw = fields.get("client_raw") or "?"
+
+        print(f"[{i}/{len(pdfs)}] {pdf_path.name}")
+        print(f"  Year       : {year}")
+        print(f"  Form type  : {form_type}")
+        print(f"  Fund (raw) : {fund_raw}")
+        if fields.get("share_class"):
+            print(f"  Share class: {fields['share_class']}")
+        print(f"  Client raw : {repr(client_raw)}")
+        print(f"  Client clean: {repr(cleaned) if cleaned else '(could not clean)'}")
+        print()
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    debug   = "--debug"   in sys.argv
-    dry_run = "--dry-run" in sys.argv
+    debug    = "--debug"    in sys.argv
+    debug2   = "--debug2"   in sys.argv
+    dry_run  = "--dry-run"  in sys.argv
+
+    if debug2:
+        debug2_folder(DROP_FOLDER)
+        sys.exit(0)
 
     if debug:
         print("=== DEBUG MODE — no files will be moved ===\n")
